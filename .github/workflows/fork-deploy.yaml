@@ -1,0 +1,172 @@
+---
+# Build and publish the add-on image on every push to main.
+#
+# Every push to main is intentional and ready to publish — there is no
+# Renovate automerge race to gate against. After the image is pushed, a
+# GitHub Release is created from the changelog.
+name: Deploy
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: deploy
+
+env:
+  IMAGE_NAME: ghcr.io/avocadio-addons/vaultwarden
+
+jobs:
+  metadata:
+    name: Gather build metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read build metadata
+        id: meta
+        run: |
+          version=$(yq -r '.version' vaultwarden/config.yaml)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if gh release view "v${VERSION}" &>/dev/null; then
+            echo "Release v${VERSION} already exists; skipping deploy."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: metadata
+    if: needs.metadata.outputs.version != ''
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        arch: [amd64, aarch64]
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read build_from for this arch
+        id: meta
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          build_from=$(yq -r ".build_from.${ARCH}" vaultwarden/build.yaml)
+          echo "build_from=${build_from}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: vaultwarden
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_FROM=${{ steps.meta.outputs.build_from }}
+            BUILD_ARCH=${{ matrix.arch }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            BUILD_DESCRIPTION=Open source password management solution
+            BUILD_NAME=Vaultwarden
+            BUILD_REF=${{ github.sha }}
+            BUILD_REPOSITORY=${{ github.repository }}
+            BUILD_VERSION=${{ needs.metadata.outputs.version }}
+          tags: |
+            ${{ env.IMAGE_NAME }}/${{ matrix.arch }}:${{ needs.metadata.outputs.version }}
+          provenance: true
+          sbom: true
+          cache-from: |
+            type=gha,scope=${{ matrix.arch }}
+            type=registry,ref=${{ env.IMAGE_NAME }}/${{ matrix.arch }}:latest
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          push: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}/${{ matrix.arch }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  manifest:
+    name: Create multi-arch manifest
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${VERSION}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "${IMAGE_NAME}/amd64:${VERSION}" \
+            "${IMAGE_NAME}/aarch64:${VERSION}"
+
+  release:
+    name: Create GitHub Release
+    needs: [metadata, manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          body=$(awk -v ver="${VERSION}" '
+            /^## / { if (found) exit; if ($2 == ver) found=1; next }
+            found { print }
+          ' vaultwarden/CHANGELOG.md)
+
+          if [[ -z "${body}" ]]; then
+            body="Release ${VERSION}"
+          fi
+
+          if gh release view "v${VERSION}" &>/dev/null; then
+            echo "Release v${VERSION} already exists; skipping."
+            exit 0
+          fi
+
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes "${body}" \
+            --target "${{ github.sha }}"
