@@ -1,0 +1,104 @@
+---
+# Watches the abandoned upstream and raises its commits as a pull request.
+#
+# This fork carries a permanent delta against
+# hassio-addons/app-vaultwarden: its own image, its own version line and the
+# CI/stamp/deploy pipeline that replaces the reusable workflows a fork cannot
+# call. Merging upstream automatically would fight that delta on main, so the
+# sync branch is pushed as upstream's own history and a pull request is opened
+# against main. Conflicts show up in the pull request and are resolved there.
+#
+# Nothing here merges anything. If upstream comes back to life, review the
+# pull request and decide what is worth taking.
+name: Upstream sync
+
+# yamllint disable-line rule:truthy
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+
+env:
+  UPSTREAM: https://github.com/hassio-addons/app-vaultwarden.git
+  SYNC_BRANCH: upstream-sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream "${UPSTREAM}"
+          git fetch --no-tags upstream main
+          sha=$(git rev-parse upstream/main)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "${sha}" HEAD; then
+            echo "ahead=false" >> "$GITHUB_OUTPUT"
+            echo "Already contains upstream ${sha:0:7}; nothing to sync." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ahead=true" >> "$GITHUB_OUTPUT"
+            git log --oneline HEAD.."${sha}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The branch is upstream's history verbatim, not a merge attempt, so
+      # this push never fails on conflicts. GitHub works the conflicts out
+      # against main when the pull request is opened.
+      - name: Push the sync branch
+        if: steps.fetch.outputs.ahead == 'true'
+        run: |
+          git push --force origin \
+            "${{ steps.fetch.outputs.sha }}:refs/heads/${SYNC_BRANCH}"
+
+      # A pull request opened with GITHUB_TOKEN does not start CI. That is
+      # fine here: the branch is upstream's code, and what matters is the
+      # merge result, which CI builds once a real PR carries it to main.
+      - name: Open or update the pull request
+        if: steps.fetch.outputs.ahead == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.fetch.outputs.short }}
+        run: |
+          existing=$(gh pr list --head "${SYNC_BRANCH}" --base main \
+            --state open --json number --jq '.[0].number')
+
+          if [[ -n "${existing}" ]]; then
+            gh pr comment "${existing}" \
+              --body "Upstream moved to \`${SHORT}\`; branch force-updated."
+            echo "Updated PR #${existing} to ${SHORT}." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          url=$(gh pr create --base main --head "${SYNC_BRANCH}" \
+            --title "⬆️ Sync upstream app-vaultwarden (${SHORT})" \
+            --body "$(printf '%s\n' \
+              "Upstream \`hassio-addons/app-vaultwarden\` has moved to \`${SHORT}\`." \
+              "" \
+              "This branch is upstream's history as-is. Expect conflicts in the" \
+              "files this fork owns:" \
+              "" \
+              "- \`vaultwarden/config.yaml\` — version, url and image" \
+              "- \`vaultwarden/Dockerfile\` — the Vaultwarden pin" \
+              "- \`.github/workflows/ci.yaml\`, \`deploy.yaml\` — replaced here" \
+              "- \`vaultwarden/CHANGELOG.md\`, \`repository.json\` — fork-only" \
+              "" \
+              "Take upstream's side only for changes outside that set." \
+              "Do not merge this to adopt \`version: dev\` or the" \
+              "\`hassio-addons/workflows\` callers back.")")
+
+          echo "Opened ${url} for upstream ${SHORT}." >> "$GITHUB_STEP_SUMMARY"
