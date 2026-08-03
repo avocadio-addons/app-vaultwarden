@@ -21,6 +21,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  IMAGE_NAME: ghcr.io/avocadio-addons/vaultwarden
+
 jobs:
   build:
     name: Build ${{ matrix.arch }}
@@ -62,6 +65,12 @@ jobs:
             BUILD_REF=${{ github.sha }}
             BUILD_REPOSITORY=${{ github.repository }}
             BUILD_VERSION=${{ steps.meta.outputs.version }}
-          cache-from: type=gha,scope=${{ matrix.arch }}
+          # type=gha covers repeated pushes to the same pull request; the
+          # registry cache written by the last deploy is what a brand new
+          # branch hits instead. Read anonymously — the package is public
+          # because Supervisor pulls it unauthenticated.
+          cache-from: |
+            type=gha,scope=${{ matrix.arch }}
+            type=registry,ref=${{ env.IMAGE_NAME }}/${{ matrix.arch }}:buildcache
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
           push: false
