@@ -124,20 +124,12 @@ based on the following:
 - `MINOR`: Backwards-compatible new features and enhancements.
 - `PATCH`: Backwards-compatible bugfixes and package updates.
 
+For migration instructions (switching to or from this fork), see
+[MIGRATING.md][migrating].
+
 ## Support
 
-Got questions?
-
-You have several options to get them answered:
-
-- The [Home Assistant Community Apps Discord chat server][discord] for app
-  support and feature requests.
-- The [Home Assistant Discord chat server][discord-ha] for general Home
-  Assistant discussions and questions.
-- The Home Assistant [Community Forum][forum].
-- Join the [Reddit subreddit][reddit] in [/r/homeassistant][reddit]
-
-You could also [open an issue here][issue] GitHub.
+Got questions? [Open an issue][issue] on GitHub.
 
 ## Authors & contributors
 
@@ -171,14 +163,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 [addon-badge]: https://my.home-assistant.io/badges/supervisor_addon.svg
-[addon]: https://my.home-assistant.io/redirect/supervisor_addon/?addon=a0d7b954_bitwarden&repository_url=https%3A%2F%2Fgithub.com%2Fhassio-addons%2Frepository
-[contributors]: https://github.com/hassio-addons/app-vaultwarden/graphs/contributors
-[discord-ha]: https://discord.gg/c5DvZ4e
-[discord]: https://discord.me/hassioaddons
-[forum]: https://community.home-assistant.io/t/home-assistant-community-add-on-bitwarden-rs/115573?u=frenck
+[addon]: https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Favocadio-addons%2Fapp-vaultwarden
+[changelog]: https://github.com/avocadio-addons/app-vaultwarden/blob/main/vaultwarden/CHANGELOG.md
+[contributors]: https://github.com/avocadio-addons/app-vaultwarden/graphs/contributors
 [frenck]: https://github.com/frenck
-[issue]: https://github.com/hassio-addons/app-vaultwarden/issues
-[reddit]: https://reddit.com/r/homeassistant
-[releases]: https://github.com/hassio-addons/app-vaultwarden/releases
+[issue]: https://github.com/avocadio-addons/app-vaultwarden/issues
+[migrating]: https://github.com/avocadio-addons/app-vaultwarden/blob/main/MIGRATING.md
+[releases]: https://github.com/avocadio-addons/app-vaultwarden/releases
 [semver]: https://semver.org/spec/v2.0.0.html
 [vaultwarden]: https://github.com/dani-garcia/vaultwarden
