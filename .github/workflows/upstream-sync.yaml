@@ -138,6 +138,20 @@ jobs:
             git checkout -B merge-trial "${SHA}"
           fi
 
+      - name: Strip upstream-only workflow files
+        if: steps.check.outputs.found == 'true' && steps.dedupe.outputs.skip != 'true'
+        run: |
+          # These files were deleted in this fork. Upstream still ships
+          # them, so any merge or checkout of an upstream tag brings them
+          # back — and the default GITHUB_TOKEN cannot push workflow-file
+          # changes. Drop them before pushing.
+          git rm --ignore-unmatch --quiet \
+            .github/workflows/ci.yaml \
+            .github/workflows/deploy.yaml
+          if ! git diff --cached --quiet; then
+            git commit -m "Strip upstream-only workflow files"
+          fi
+
       - name: Push the sync branch
         if: steps.check.outputs.found == 'true' && steps.dedupe.outputs.skip != 'true'
         run: |
