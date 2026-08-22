@@ -145,6 +145,7 @@ jobs:
           # ci.yaml, deploy.yaml, labels.yaml, etc. that were deleted
           # here, and the default GITHUB_TOKEN cannot push workflow-file
           # changes anyway. Reset the directory to exactly what main has.
+          git rm -r --quiet .github/workflows/
           git checkout main -- .github/workflows/
           if ! git diff --cached --quiet; then
             git commit -m "Restore fork workflow files"
