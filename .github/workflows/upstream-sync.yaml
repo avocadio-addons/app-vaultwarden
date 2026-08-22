@@ -138,18 +138,16 @@ jobs:
             git checkout -B merge-trial "${SHA}"
           fi
 
-      - name: Strip upstream-only workflow files
+      - name: Restore fork's .github/workflows
         if: steps.check.outputs.found == 'true' && steps.dedupe.outputs.skip != 'true'
         run: |
-          # These files were deleted in this fork. Upstream still ships
-          # them, so any merge or checkout of an upstream tag brings them
-          # back — and the default GITHUB_TOKEN cannot push workflow-file
-          # changes. Drop them before pushing.
-          git rm --ignore-unmatch --quiet \
-            .github/workflows/ci.yaml \
-            .github/workflows/deploy.yaml
+          # This fork owns .github/workflows entirely. Upstream ships
+          # ci.yaml, deploy.yaml, labels.yaml, etc. that were deleted
+          # here, and the default GITHUB_TOKEN cannot push workflow-file
+          # changes anyway. Reset the directory to exactly what main has.
+          git checkout main -- .github/workflows/
           if ! git diff --cached --quiet; then
-            git commit -m "Strip upstream-only workflow files"
+            git commit -m "Restore fork workflow files"
           fi
 
       - name: Push the sync branch
