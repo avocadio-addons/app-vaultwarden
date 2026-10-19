@@ -1,0 +1,193 @@
+---
+# Build and publish the add-on image on every push to main.
+#
+# Every push to main is intentional and ready to publish — there is no
+# Renovate automerge race to gate against. After the image is pushed, a
+# GitHub Release is created from the changelog.
+name: Deploy
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: deploy
+
+env:
+  IMAGE_NAME: ghcr.io/avocadio-addons/vaultwarden
+
+jobs:
+  metadata:
+    name: Gather build metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # An unreadable version has to fail here rather than fall through: an
+      # empty value would be published as the tag `v`.
+      - name: Read build metadata
+        id: meta
+        run: |
+          version=$(yq -r '.version' vaultwarden/config.yaml)
+          if [[ -z "${version}" || "${version}" == "null" ]]; then
+            echo "::error::Could not read version from vaultwarden/config.yaml"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # The release is the record of what has been published. Every push to
+      # main reaches this workflow, but only a version bump should rebuild —
+      # without this gate a docs commit republishes an existing version over
+      # tags that already exist.
+      - name: Check for existing release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if gh release view "v${VERSION}" &>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Skipped: v${VERSION} is already released." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Publishing add-on ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: metadata
+    if: needs.metadata.outputs.exists == 'false'
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        arch: [amd64, aarch64]
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read build_from for this arch
+        id: meta
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          build_from=$(yq -r ".build_from.${ARCH}" vaultwarden/build.yaml)
+          echo "build_from=${build_from}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: vaultwarden
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_FROM=${{ steps.meta.outputs.build_from }}
+            BUILD_ARCH=${{ matrix.arch }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            BUILD_DESCRIPTION=Open source password management solution
+            BUILD_NAME=Vaultwarden
+            BUILD_REF=${{ github.sha }}
+            BUILD_REPOSITORY=${{ github.repository }}
+            BUILD_VERSION=${{ needs.metadata.outputs.version }}
+          tags: |
+            ${{ env.IMAGE_NAME }}/${{ matrix.arch }}:${{ needs.metadata.outputs.version }}
+          provenance: true
+          sbom: true
+          # Registry cache, not type=gha: a cache written by a pull request
+          # run is not readable from main, so the gha scope was always cold
+          # here while still evicting CI's entries from the shared 10GB. The
+          # previous registry ref pointed at ${arch}:latest, a tag nothing
+          # pushes — only the manifest job publishes :latest, on the
+          # unsuffixed name — so it never resolved either.
+          # image-manifest/oci-mediatypes are required for GHCR to accept a
+          # cache manifest.
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}/${{ matrix.arch }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}/${{ matrix.arch }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+          push: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}/${{ matrix.arch }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  manifest:
+    name: Create multi-arch manifest
+    needs: [metadata, build]
+    if: needs.metadata.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${VERSION}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "${IMAGE_NAME}/amd64:${VERSION}" \
+            "${IMAGE_NAME}/aarch64:${VERSION}"
+
+  release:
+    name: Create GitHub Release
+    needs: [metadata, manifest]
+    if: needs.metadata.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          body=$(awk -v ver="${VERSION}" '
+            /^## / { if (found) exit; if ($2 == ver) found=1; next }
+            found { print }
+          ' vaultwarden/CHANGELOG.md)
+
+          if [[ -z "${body}" ]]; then
+            body="Release ${VERSION}"
+          fi
+
+          if gh release view "v${VERSION}" &>/dev/null; then
+            echo "Release v${VERSION} already exists; skipping."
+            exit 0
+          fi
+
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes "${body}" \
+            --target "${{ github.sha }}"

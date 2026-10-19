@@ -1,0 +1,76 @@
+---
+# Build check for pull requests.
+#
+# Builds what fork-deploy.yaml builds, for both architectures, and throws
+# the result away. A PR cannot merge until this passes.
+name: CI
+
+# yamllint disable-line rule:truthy
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/avocadio-addons/vaultwarden
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        arch: [amd64, aarch64]
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read build metadata
+        id: meta
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version=$(yq -r '.version' vaultwarden/config.yaml)
+          build_from=$(yq -r ".build_from.${ARCH}" vaultwarden/build.yaml)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "build_from=${build_from}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: vaultwarden
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_FROM=${{ steps.meta.outputs.build_from }}
+            BUILD_ARCH=${{ matrix.arch }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            BUILD_DESCRIPTION=Open source password management solution
+            BUILD_NAME=Vaultwarden
+            BUILD_REF=${{ github.sha }}
+            BUILD_REPOSITORY=${{ github.repository }}
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+          # type=gha covers repeated pushes to the same pull request; the
+          # registry cache written by the last deploy is what a brand new
+          # branch hits instead. Read anonymously — the package is public
+          # because Supervisor pulls it unauthenticated.
+          cache-from: |
+            type=gha,scope=${{ matrix.arch }}
+            type=registry,ref=${{ env.IMAGE_NAME }}/${{ matrix.arch }}:buildcache
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          push: false

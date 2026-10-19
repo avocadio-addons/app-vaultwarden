@@ -1,0 +1,268 @@
+---
+# Watches upstream for new releases and opens a pull request to merge
+# the release tag into this fork.
+#
+# This fork's main = upstream's latest release tag + fork-specific delta.
+# Upstream's main branch is full of Renovate digest-bump noise on reusable
+# workflows that never reach stable users — syncing from release tags
+# filters that out and gives us exactly what upstream ships.
+#
+# Nothing here merges anything. If upstream releases, review the pull
+# request, bump the version in config.yaml to <upstream>.<fork-patch>,
+# add a changelog entry, and merge.
+name: Upstream sync
+
+# yamllint disable-line rule:truthy
+on:
+  schedule:
+    # Weekly, Mondays. Upstream releases a few times a year; a daily check
+    # bought nothing but a daily chance to redo work already open as a PR.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+
+env:
+  UPSTREAM: https://github.com/hassio-addons/app-vaultwarden.git
+  UPSTREAM_API: repos/hassio-addons/app-vaultwarden/releases/latest
+  SYNC_BRANCH: upstream-sync
+  IMAGE_NAME: ghcr.io/avocadio-addons/vaultwarden
+
+jobs:
+  sync:
+    # Anyone who forks this repo inherits the schedule. Without this they
+    # get weekly pull requests opened against their own copy.
+    if: github.repository == 'avocadio-addons/app-vaultwarden'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release=$(gh api "${UPSTREAM_API}" --jq '.tag_name // empty') || true
+
+          if [[ -z "${release}" ]]; then
+            echo "No upstream release found."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "tag=${release}" >> "$GITHUB_OUTPUT"
+          echo "version=${release#v}" >> "$GITHUB_OUTPUT"
+
+          # Fetch the release tag from upstream
+          git remote add upstream "${UPSTREAM}"
+          git fetch --no-tags upstream "refs/tags/${release}:refs/tags/upstream-${release}"
+
+          tag_sha=$(git rev-parse "upstream-${release}")
+          echo "sha=${tag_sha}" >> "$GITHUB_OUTPUT"
+          echo "short=${tag_sha:0:7}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "${tag_sha}" HEAD; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "Already contains upstream ${release}; nothing to sync." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+
+            # Grab upstream release notes for the PR body
+            gh api "${UPSTREAM_API}" --jq '.body // ""' > /tmp/release-notes.md
+          fi
+
+      # Upstream's tag stays a non-ancestor of main until the sync PR is
+      # merged, so `found` keeps reporting true and every scheduled run would
+      # redo the trial merge, rebuild the tree, and comment again — for as
+      # long as the PR sits unreviewed. Act only when the release is one we
+      # have not already raised. A manual dispatch always re-runs.
+      - name: Skip a release already open as a pull request
+        id: dedupe
+        if: steps.check.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ steps.check.outputs.tag }}
+        run: |
+          if [[ "${EVENT}" == "workflow_dispatch" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          title=$(gh pr list --head "${SYNC_BRANCH}" --base main \
+            --state open --json title --jq '.[0].title')
+
+          if [[ "${title}" == "⬆️ Sync upstream ${TAG}" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream ${TAG} is already open as a pull request." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attempt trial merge
+        id: merge
+        if: steps.check.outputs.found == 'true' && steps.dedupe.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+          SHA: ${{ steps.check.outputs.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Create a throwaway branch from main for the trial merge
+          git checkout -b merge-trial
+
+          if git merge --no-commit --no-ff "${SHA}" 2>/dev/null; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+            echo "conflicts=" >> "$GITHUB_OUTPUT"
+            # Complete the merge so the branch is buildable
+            git commit -m "Trial merge of upstream ${TAG}"
+          else
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            echo "conflicts=${conflicts}" >> "$GITHUB_OUTPUT"
+            # Abort so the branch is clean for pushing
+            git merge --abort
+            # Push upstream's tag commit directly as the sync branch —
+            # conflicts are resolved in the PR
+            git checkout -B merge-trial "${SHA}"
+          fi
+
+      - name: Restore fork's .github/workflows
+        if: steps.check.outputs.found == 'true' && steps.dedupe.outputs.skip != 'true'
+        run: |
+          # This fork owns .github/workflows entirely. Upstream ships
+          # ci.yaml, deploy.yaml, labels.yaml, etc. that were deleted
+          # here, and the default GITHUB_TOKEN cannot push workflow-file
+          # changes anyway. Reset the directory to exactly what main has.
+          git rm -r --quiet .github/workflows/
+          git checkout main -- .github/workflows/
+          if ! git diff --cached --quiet; then
+            git commit -m "Restore fork workflow files"
+          fi
+
+      - name: Push the sync branch
+        if: steps.check.outputs.found == 'true' && steps.dedupe.outputs.skip != 'true'
+        run: |
+          git push --force origin "merge-trial:refs/heads/${SYNC_BRANCH}"
+
+      - name: Build merged tree (amd64 only)
+        id: build
+        if: steps.merge.outputs.status == 'clean'
+        run: |
+          git checkout "${SYNC_BRANCH}" 2>/dev/null || \
+            git checkout merge-trial
+
+          build_from=$(yq -r '.build_from.amd64' vaultwarden/build.yaml)
+          version=$(yq -r '.version' vaultwarden/config.yaml)
+
+          # Just check that the Dockerfile parses and the build starts.
+          # A full multi-arch build is wasteful for a daily signal.
+          docker buildx create --use --name sync-builder
+          if docker buildx build \
+            --platform linux/amd64 \
+            --cache-from "type=registry,ref=${IMAGE_NAME}/amd64:buildcache" \
+            --build-arg "BUILD_FROM=${build_from}" \
+            --build-arg "BUILD_VERSION=${version}" \
+            --build-arg "BUILD_ARCH=amd64" \
+            --build-arg "BUILD_DATE=1970-01-01T00:00:00Z" \
+            --build-arg "BUILD_DESCRIPTION=sync-check" \
+            --build-arg "BUILD_NAME=Vaultwarden" \
+            --build-arg "BUILD_REF=sync" \
+            --build-arg "BUILD_REPOSITORY=${{ github.repository }}" \
+            vaultwarden 2>&1; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update the pull request
+        if: steps.check.outputs.found == 'true' && steps.dedupe.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.check.outputs.tag }}
+          VERSION: ${{ steps.check.outputs.version }}
+          SHORT: ${{ steps.check.outputs.short }}
+          MERGE_STATUS: ${{ steps.merge.outputs.status }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          BUILD_RESULT: ${{ steps.build.outputs.result }}
+        run: |
+          # Compose the PR body
+          body="Upstream [\`hassio-addons/app-vaultwarden\`]"
+          body+="(https://github.com/hassio-addons/app-vaultwarden) "
+          body+="released **${TAG}** (\`${SHORT}\`)."
+          body+=$'\n\n'
+
+          if [[ "${MERGE_STATUS}" == "clean" ]]; then
+            body+="**Merge: clean** ✅"
+          else
+            body+="**Merge: conflicts** ❌"
+            body+=$'\n\nConflicted files:\n'
+            for f in ${CONFLICTS}; do
+              body+="- \`${f}\`"$'\n'
+            done
+          fi
+          body+=$'\n'
+
+          if [[ "${MERGE_STATUS}" == "clean" ]]; then
+            if [[ "${BUILD_RESULT}" == "pass" ]]; then
+              body+="**Build (amd64): pass** ✅"
+            else
+              body+="**Build (amd64): fail** ❌"
+            fi
+            body+=$'\n'
+          fi
+
+          body+=$'\n---\n\n'
+          body+="### Before merging"$'\n\n'
+          body+="1. Resolve any conflicts"$'\n'
+          body+="2. Set \`version\` in \`config.yaml\` to \`${VERSION}.1\`"$'\n'
+          body+="3. Add a changelog entry in \`vaultwarden/CHANGELOG.md\`"$'\n'
+          body+="4. Do **not** re-adopt \`version: dev\` or the "
+          body+="\`hassio-addons/workflows\` callers"$'\n'
+
+          body+=$'\n---\n\n'
+          body+="### Upstream release notes"$'\n\n'
+          if [[ -f /tmp/release-notes.md ]]; then
+            cat /tmp/release-notes.md >> /dev/null 2>&1
+            body+="$(cat /tmp/release-notes.md)"
+          else
+            body+="*(none)*"
+          fi
+
+          # Files this fork owns that will always conflict
+          body+=$'\n\n---\n\n'
+          body+="### Fork-owned files (expect conflicts)"$'\n\n'
+          body+="- \`vaultwarden/config.yaml\` — version, url and image"$'\n'
+          body+="- \`vaultwarden/Dockerfile\` — the Vaultwarden pin"$'\n'
+          body+="- \`vaultwarden/CHANGELOG.md\` — fork-only"$'\n'
+          body+="- \`repository.json\` — fork-only"$'\n'
+          body+="- \`.github/workflows/ci.yaml\`, \`deploy.yaml\` — deleted here; "
+          body+="resolve with \`git rm\`"$'\n'
+
+          existing=$(gh pr list --head "${SYNC_BRANCH}" --base main \
+            --state open --json number --jq '.[0].number')
+
+          if [[ -n "${existing}" ]]; then
+            gh pr edit "${existing}" --body "${body}"
+            gh pr comment "${existing}" \
+              --body "Updated for upstream ${TAG} (\`${SHORT}\`)."
+            echo "Updated PR #${existing} for ${TAG}." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            url=$(gh pr create --base main --head "${SYNC_BRANCH}" \
+              --title "⬆️ Sync upstream ${TAG}" \
+              --body "${body}")
+            echo "Opened ${url} for upstream ${TAG}." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
